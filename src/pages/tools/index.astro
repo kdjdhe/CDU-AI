@@ -3,17 +3,32 @@ import BaseLayout from '../../layouts/BaseLayout.astro';
 import PageHeader from '../../components/PageHeader.astro';
 import Icon from '../../components/Icon.astro';
 import ToolCard from '../../components/ToolCard.astro';
-import { tools, toolCategories } from '../../data/tools';
+import { tools, toolCategories, toolCapabilities } from '../../data/tools';
+import { toolSections, toolCategoryAliases } from '../../data/tool-sections.mjs';
+import { createCatalogView, validateCatalogSections } from '../../lib/tool-catalog.mjs';
 
-const counts = new Map(toolCategories.map((category) => [category.id, tools.filter((tool) => tool.category === category.id).length]));
+const counts = new Map(toolCategories.map((category) => [category.id, tools.filter((tool) => tool.category === category.id || (tool.alsoIn ?? []).includes(category.id)).length]));
+const capCounts = new Map(toolCapabilities.map((cap) => [cap.id, tools.filter((tool) => tool.capabilities.includes(cap.id)).length]));
 const hasTools = tools.length > 0;
+const suggestionUrl = 'https://github.com/A7m0spHere/CDU-AI/issues/new?template=tool-suggestion.yml';
+const catalogErrors = validateCatalogSections(tools, toolCategories);
+if (catalogErrors.length) throw new Error(catalogErrors.join('\n'));
+const defaultView = createCatalogView('all', tools, toolCategories);
+const defaultGroups = new Map(defaultView.categories.flatMap((category) => category.groups.map((group) => [group.key, group] as const)));
+const toolById = new Map(tools.map((tool) => [tool.id, tool]));
+const foldedDefault = defaultView.categories.flatMap((category) => category.groups).reduce((total, group) => total + group.collapsedIds.length, 0);
+const catalogConfig = JSON.stringify({
+  views: Object.fromEntries(['all', ...toolCategories.map((category) => category.id)].map((id) => [id, createCatalogView(id, tools, toolCategories)])),
+  categoryNames: Object.fromEntries(toolCategories.map((category) => [category.id, category.name])),
+  aliases: toolCategoryAliases,
+}).replace(/</g, '\\u003c');
 ---
 
 <BaseLayout
   title="AI 工具资源"
   description={
     hasTools
-      ? `按使用场景整理的 AI 工具索引，共 ${tools.length} 个工具、${toolCategories.length} 个分类。标注门槛、费用与限制。`
+      ? `按使用场景整理的 AI 工具索引，共 ${tools.length} 个工具、${toolCategories.length} 个分类。标注类型、门槛、费用与限制。`
       : '工具目录由维护者按需补充：标注使用场景、上手门槛、费用模式与限制，收录不等于推荐。'
   }
 >
@@ -21,7 +36,7 @@ const hasTools = tools.length > 0;
     index="03"
     eyebrow="工具资源"
     title="AI 工具资源"
-    lede="按使用场景分类。标注上手门槛、费用模式与限制；收录不等于推荐。"
+    lede="按使用场景分类，写清技术类型、上手门槛、费用与限制。收录不等于推荐，也不按热度排名。"
     meta={
       hasTools
         ? [
@@ -41,6 +56,10 @@ const hasTools = tools.length > 0;
           <div><dt>场景分类</dt><dd>{String(toolCategories.length).padStart(2, '0')}</dd></div>
         </dl>
         <p>{hasTools ? '持续补充中，收录不等于推荐。' : '由维护者按需补充，收录不等于推荐。'}</p>
+        <a class="aside-card__link" href={suggestionUrl} target="_blank" rel="noopener noreferrer">
+          建议收录工具
+          <Icon name="arrow-up-right" size={14} />
+        </a>
       </div>
     </Fragment>
   </PageHeader>
@@ -49,24 +68,26 @@ const hasTools = tools.length > 0;
     <div class="container">
       <div class="notice notice--warm" data-reveal>
         <Icon name="info" size={17} />
-        <p><strong>收录不等于推荐，也不是广告。</strong>工具能力、价格和可用地区会变化，请以官网为准。不要输入个人敏感信息。</p>
+        <p><strong>收录不等于推荐，也不是广告。</strong>工具能力、价格和可用地区会变化，请以官网为准。不要输入个人敏感信息；生成内容发布前先确认版权与授权。</p>
       </div>
 
       <h2 class="sr-only">工具目录</h2>
       {hasTools && (
-      <div class="catalog-layout" data-filter-root data-reveal>
+      <div class="catalog-layout" data-filter-root data-tool-catalog data-reveal>
         <aside class="catalog-sidebar" aria-label="工具筛选">
-          <label class="sr-only" for="tool-search">搜索工具名、使用场景或标签</label>
+          <label class="sr-only" for="tool-search">搜索工具名、别名、场景或技术类型</label>
           <div class="search-field">
             <Icon name="search" size={18} />
             <input
               id="tool-search"
               type="search"
-              placeholder="搜索工具或场景…"
+              placeholder="搜索工具、别名或技术类型…"
               autocomplete="off"
               data-filter-search
             />
           </div>
+
+          <p class="catalog-search-scope" data-filter-scope>搜索范围：全部工具</p>
 
           <nav class="catalog-nav" aria-label="按场景筛选">
             <div class="catalog-nav__head">
@@ -74,12 +95,19 @@ const hasTools = tools.length > 0;
               <span class="filter-count">{tools.length} 个条目</span>
             </div>
             <div class="filter-chips filter-chips--vertical" role="group" aria-label="按场景筛选">
-              <button class="filter-chip" type="button" data-filter-value="all" aria-pressed="true">
+              <button class="filter-chip" type="button" data-filter-value="all" data-filter-label="全部工具" aria-pressed="true">
                 全部工具
                 <span class="filter-chip__count">{tools.length}</span>
               </button>
               {toolCategories.map((category) => (
-                <button class="filter-chip" type="button" data-filter-value={category.id} aria-pressed="false">
+                <button
+                  class="filter-chip"
+                  type="button"
+                  data-filter-value={category.id}
+                  data-filter-label={category.name}
+                  aria-pressed="false"
+                  title={category.techHint}
+                >
                   {category.name}
                   <span class="filter-chip__count">{counts.get(category.id) ?? 0}</span>
                 </button>
@@ -87,31 +115,102 @@ const hasTools = tools.length > 0;
             </div>
           </nav>
 
+          <div class="catalog-nav">
+            <div class="catalog-nav__head">
+              <span>能力筛选</span>
+              <span class="filter-count">可多选</span>
+            </div>
+            <div class="filter-chips filter-chips--vertical" role="group" aria-label="按能力筛选">
+              {toolCapabilities.map((cap) => (
+                <button
+                  class="filter-chip filter-chip--cap"
+                  type="button"
+                  data-filter-cap={cap.id}
+                  aria-pressed="false"
+                  title={cap.hint}
+                >
+                  {cap.label}
+                  <span class="filter-chip__count">{capCounts.get(cap.id) ?? 0}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
           <p class="catalog-sidebar__note">
             <Icon name="info" size={14} />
-            按真实使用场景整理，不按热度排名。收录不等于推荐。
+            搜索限定在当前栏目；选择「全部工具」可扩大搜索范围。能力可多选并取交集。Agent 的更多社区条目默认收起，搜索或能力筛选时自动展开匹配项。
           </p>
         </aside>
 
         <div class="catalog-main">
           <div class="results-bar">
-            <p aria-live="polite">显示 <strong data-filter-count>{tools.length}</strong> 个工具</p>
+            <p aria-live="polite">匹配 <strong data-filter-count>{tools.length}</strong> 项<span data-filter-folded-note hidden={foldedDefault === 0}>（<strong data-filter-folded-count>{foldedDefault}</strong> 项已折叠）</span></p>
             <button class="clear-filters" type="button" data-clear-filters hidden>清除筛选</button>
           </div>
 
-          <div class="tool-grid">
-            {tools.map((tool) => (
-              <ToolCard
-                tool={tool}
-                categoryLabel={toolCategories.find((category) => category.id === tool.category)?.name ?? '工具'}
-              />
+          <div class="catalog-sections">
+            {toolCategories.map((category) => (
+              <section class="catalog-category" data-filter-group data-catalog-category={category.id} aria-labelledby={`catalog-category-${category.id}`}>
+                <div class="catalog-category__heading">
+                  <h2 id={`catalog-category-${category.id}`}>{category.name}</h2>
+                  <p>{category.description}</p>
+                </div>
+                {(toolSections[category.id] ?? []).map((section) => {
+                  const key = `${category.id}-${section.id}`;
+                  const group = defaultGroups.get(key)!;
+                  const collapsedIds = new Set(group.collapsedIds);
+                  return (
+                    <section class="tool-group" data-filter-group data-tool-group={key} data-tool-category={category.id} hidden={group.toolIds.length === 0} aria-labelledby={`tool-group-${key}`}>
+                      <div class:list={['tool-group__heading', { 'sr-only': toolSections[category.id].length === 1 }]}>
+                        <h3 id={`tool-group-${key}`}>{section.name}</h3>
+                        {section.description && <p>{section.description}</p>}
+                      </div>
+                      <div class="tool-grid" data-catalog-target={key}>
+                        {group.toolIds.filter((id) => !collapsedIds.has(id)).map((id) => (
+                          <ToolCard tool={toolById.get(id)!} categoryLabel={category.name} headingLevel="h4" />
+                        ))}
+                      </div>
+                      {section.collapse && (
+                        <details class="tool-more" data-filter-group data-collapse hidden={group.collapsedIds.length === 0}>
+                          <summary class="tool-more__summary">
+                            <span class="tool-more__heading">
+                              <span class="tool-more__title">{section.collapse.label}</span>
+                              <span class="tool-more__meta"><span data-collapse-count>{group.collapsedIds.length}</span> 个条目 · 默认收起，搜索或能力筛选时自动展开</span>
+                            </span>
+                            <Icon name="chevron-down" size={18} class="tool-more__icon" />
+                          </summary>
+                          <div class="tool-grid tool-more__grid" data-catalog-target={`${key}-more`}>
+                            {group.collapsedIds.map((id) => (
+                              <ToolCard tool={toolById.get(id)!} categoryLabel={category.name} headingLevel="h4" collapsed />
+                            ))}
+                          </div>
+                        </details>
+                      )}
+                    </section>
+                  );
+                })}
+              </section>
             ))}
           </div>
+
+          <div data-catalog-pool hidden></div>
+          <script type="application/json" data-catalog-config set:html={catalogConfig} />
 
           <div class="empty-state" data-empty-state hidden>
             <Icon name="search" size={28} />
             <h2>没有找到匹配的工具</h2>
-            <p>试试更短的关键词、换一个分类，或者点击「清除筛选」看看全部条目。</p>
+            <p>试试更短的关键词，或选择「全部工具」扩大搜索范围；也可以清除筛选重新浏览。</p>
+          </div>
+
+          <div class="catalog-cta">
+            <div>
+              <h2>发现好用的工具？</h2>
+              <p>工具目录由维护者审核后入库，不收自动提交。请用仓库的「工具建议」Issue 模板说明用途、官网与限制。</p>
+            </div>
+            <a class="btn btn--soft btn--sm" href={suggestionUrl} target="_blank" rel="noopener noreferrer">
+              建议收录工具
+              <Icon name="arrow-up-right" size={14} />
+            </a>
           </div>
         </div>
       </div>
@@ -130,6 +229,6 @@ const hasTools = tools.length > 0;
 </BaseLayout>
 
 <script>
-  import { initFilter } from '../../scripts/filter';
-  initFilter();
+  import { initToolCatalog } from '../../scripts/tool-catalog';
+  initToolCatalog();
 </script>
