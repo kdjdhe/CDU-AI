@@ -1,6 +1,7 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import rehypeSafeLinks from './src/lib/rehype-safe-links.mjs';
+import { themeCodeTokens } from './src/lib/theme-code-tokens.mjs';
 
 // Astro 5 在内容集合为空时，会对每次 getCollection 调用打印
 //「The collection "x" does not exist or is empty」的警告；内容重建期间空集合是预期状态。
@@ -12,9 +13,9 @@ console.warn = (...args) => {
   originalWarn(...args);
 };
 
-// 部署到自有域名后，在这里补充 site（例如 https://ai.example.edu.cn），
-// Astro 才能生成绝对 URL。M0 不预设任何未经确认的线上地址。
+// Sites 公开开发预览地址，用于生成绝对 URL。
 export default defineConfig({
+  site: 'https://cdu-ai-commons.a7m0sphere.chatgpt.site',
   output: 'static',
   devToolbar: {
     enabled: false,
@@ -28,6 +29,7 @@ export default defineConfig({
     rehypePlugins: [rehypeSafeLinks],
     shikiConfig: {
       theme: 'github-light',
+      transformers: [themeCodeTokens],
       wrap: true,
     },
   },
