@@ -4,7 +4,14 @@ import { existsSync } from 'node:fs';
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadContentContext, validateCollection } from '../scripts/check-content.mjs';
+import { runInNewContext } from 'node:vm';
+import {
+  loadContentContext,
+  parseToolCategoryIds,
+  parseToolsFromSource,
+  validateCollection,
+  validateTools,
+} from '../scripts/check-content.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(root, 'dist');
@@ -29,15 +36,13 @@ const guideSlugs = guideFiles.map((file) => file.replace(/\.md$/, ''));
 const workSlugs = workFiles.map((file) => file.replace(/\.md$/, ''));
 const glossarySlugs = glossaryFiles.map((file) => file.replace(/\.md$/, ''));
 
-// 工具目录当前仍是 TypeScript 数据，测试从源文件解析；迁移为 Markdown（#8）后同步调整这里。
+// 工具目录当前仍是 TypeScript 数据。解析与字段校验复用内容检查器的同一份实现，
+// 避免「页面渲染用一套规则、检查脚本用另一套」而静默失效（见 #8 迁移计划）。
 const toolsSource = await readFile(path.join(root, 'src/data/tools.ts'), 'utf8');
-const toolsBlock = toolsSource.slice(toolsSource.indexOf('export const tools'));
-const parsedTools = [...toolsBlock.matchAll(/id: '([^']+)',\s*\n\s*name: '([^']+)'/g)].map((match) => ({
-  id: match[1],
-  name: match[2],
-}));
+const parsedTools = parseToolsFromSource(toolsSource);
+const toolCategoryIds = parseToolCategoryIds(toolsSource);
 // 工具目录允许为空（只由维护者按需添加），但文件结构必须可解析
-assert.ok(toolsBlock.includes('export const tools'), '无法定位 src/data/tools.ts 中的 tools 数组');
+assert.ok(toolsSource.includes('export const tools'), '无法定位 src/data/tools.ts 中的 tools 数组');
 
 const expectedRoutes = [
   'index.html',
@@ -56,6 +61,12 @@ const expectedRoutes = [
 
 async function read(relPath) {
   return readFile(path.join(dist, relPath), 'utf8');
+}
+
+function catalogViews(html) {
+  const json = html.match(/<script\b[^>]*data-catalog-config[^>]*>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(json, '工具页缺少栏目视图配置');
+  return JSON.parse(json).views;
 }
 
 async function walk(dir) {
@@ -209,8 +220,9 @@ test('站内搜索索引覆盖章节、术语和页面锚点', async () => {
 test('学习指南详情采用 Notion 文档结构', async () => {
   if (guideSlugs.length === 0) {
     const guideIndex = await read('guide/index.html');
-    assert.match(guideIndex, /data-content-empty/, '空指南页缺少「内容准备中」占位');
-    assert.match(guideIndex, /内容准备中/);
+    assert.match(guideIndex, /guide-doc-shell/, '指南首页应保留文档框架');
+    assert.match(guideIndex, /data-guide-home-content/, '指南首页应保留正文容器');
+    assert.doesNotMatch(guideIndex, /data-content-empty|data-page-header|wiki-navmap|wiki-outline|wiki-next/, '指南首页不再显示自动生成的介绍与占位内容');
     return;
   }
   const guide = await read('guide/' + guideSlugs[0] + '/index.html');
@@ -383,6 +395,7 @@ test('外链带新窗口与安全的 rel 属性，页面无占位废话', async 
     const html = await readFile(file, 'utf8');
     const display = path.relative(dist, file);
     assert.doesNotMatch(html, /Lorem ipsum/i, display + ' 出现 Lorem ipsum');
+    assert.doesNotMatch(html, /免费|\bfree(?:mium|\s+(?:tier|credits?|usage|access|plan))\b/i, display + ' 不应包含零成本使用表述');
     const externalLinks = html.match(/<a\b[^>]*href="https?:\/\/[^"]+"[^>]*>/g) || [];
     for (const link of externalLinks) {
       if (link.includes('target="_blank"')) {
@@ -521,6 +534,8 @@ test('内容检查器能识别新增合法条目与错误条目（fixture，不�
     invalidErrors.push(...result.errors);
   }
   const report = invalidErrors.map((error) => error.file + '  ' + error.message).join('\n');
+  assert.ok(invalidErrors.some(error => error.file === 'guide/09-cross-stage-order.md' && error.message.includes('重复')),
+    '不同 stage 的指南也不能使用相同 order，否则上一篇 / 下一篇会出现顺序冲突');
   for (const expected of ['重复', '不存在的工具', 'first-hand', 'YYYY-MM-DD', 'reviewedBy', 'related', 'category', '未知字段', '危险协议']) {
     assert.ok(report.includes(expected), '错误 fixture 未被识别：' + expected + '\n' + report);
   }
@@ -579,7 +594,6 @@ test('内容集合为空时保留框架、写作模板与占位状态', async ()
   }
 
   const expectations = [
-    ['guide/index.html', guideSlugs.length === 0],
     ['glossary/index.html', glossarySlugs.length === 0],
     ['works/index.html', workSlugs.length === 0],
   ];
@@ -598,9 +612,8 @@ test('内容集合为空时保留框架、写作模板与占位状态', async ()
   }
 });
 
-test('阶段二：内容页使用共享页头与 v2 空状态', async () => {
+test('资源列表页使用共享页头与 v2 空状态', async () => {
   const pages = [
-    ['guide/index.html', '01', '学习指南'],
     ['glossary/index.html', '02', '术语表'],
     ['tools/index.html', '03', '工具资源'],
     ['works/index.html', '04', '作品广场'],
@@ -614,7 +627,6 @@ test('阶段二：内容页使用共享页头与 v2 空状态', async () => {
 
   // 空状态断言按实际内容集合推导：有内容时不应再要求 v2 空状态（避免新增内容导致旧断言失败）。
   const emptyRoutes = [];
-  if (guideSlugs.length === 0) emptyRoutes.push('guide/index.html');
   if (glossarySlugs.length === 0) emptyRoutes.push('glossary/index.html');
   if (workSlugs.length === 0) emptyRoutes.push('works/index.html');
   for (const route of emptyRoutes) {
@@ -744,5 +756,187 @@ test('学习指南目录：六个分组、规划条目不是死链、站内链�
     checkGuideNavCoverage({ slugs: ['not-registered'], registeredSlugs }).length,
     1,
     '未登记的文章必须被内容检查器拦下',
+  );
+});
+
+
+test('工具目录数据自洽：字段合法、分类存在、Logo 文件齐全', async () => {
+  const { errors } = validateTools({ source: toolsSource, root });
+  assert.deepEqual(errors, [], '工具数据校验未通过：' + JSON.stringify(errors));
+
+  assert.ok(toolCategoryIds.length >= 10, '工具分类应至少保留 10 个场景，实际：' + toolCategoryIds.length);
+  assert.equal(new Set(parsedTools.map((tool) => tool.id)).size, parsedTools.length, '工具 id 必须唯一');
+  assert.equal(new Set(parsedTools.map((tool) => tool.name)).size, parsedTools.length, '工具名称必须唯一');
+
+  for (const tool of parsedTools) {
+    assert.ok(toolCategoryIds.includes(tool.category), tool.id + ' 的分类不在 toolCategories 中');
+    assert.ok(tool.url && tool.url.startsWith('https://'), tool.id + ' 缺少 https 官方链接');
+    assert.ok(tool.verifiedOn, tool.id + ' 缺少最近核验日期');
+  }
+
+  // 每个分类都要有工具，避免出现空分类导航
+  for (const id of toolCategoryIds) {
+    assert.ok(
+      parsedTools.some((tool) => tool.category === id || tool.alsoIn.includes(id)),
+      '分类下没有任何工具：' + id,
+    );
+  }
+});
+
+test('AIGC 合并图片与视频入口，区分创作工具和资源社区，暂不收录独立模型', async () => {
+  assert.ok(toolCategoryIds.includes('aigc'), '缺少 AIGC 一级分类');
+  assert.ok(!toolCategoryIds.includes('image') && !toolCategoryIds.includes('video'), '图片、视频应成为 AIGC 页内分区');
+  assert.ok(parsedTools.every((tool) => tool.kind !== '模型'), '当前目录不收录独立模型');
+  const html = await read('tools/index.html');
+  const groups = ['image', 'video', 'workflow', 'resources'].map((id) => (
+    html.match(new RegExp('<section\\b[^>]*data-tool-group="aigc-' + id + '"[\\s\\S]*?<\\/section>'))?.[0] ?? ''
+  ));
+  assert.ok(groups.every(Boolean), 'AIGC 应展示图片、视频、工作流与资源社区四个分区');
+  assert.ok(groups[0].includes('data-tool-id="midjourney"'), '图片产品应归入图片创作');
+  assert.ok(groups[1].includes('data-tool-id="kling"'), '视频产品应归入视频创作');
+  assert.ok(groups[2].includes('data-tool-id="comfyui"'), 'ComfyUI 是工作流工具，应保留');
+  const selectedAigc = catalogViews(html).aigc.categories[0].groups;
+  assert.ok(selectedAigc.find((group) => group.key === 'aigc-resources').toolIds.includes('civitai'), '进入 AIGC 后应显示关联的创作资源社区');
+  assert.ok(!groups.join('').includes('data-tool-id="fal"'), 'API 平台应保留在独立 API 分类');
+  const wan = parsedTools.find((tool) => tool.id === 'wan');
+  assert.equal(wan?.kind, '在线产品', '万相仅保留网页创作产品入口');
+  assert.equal(wan?.githubUrl, undefined, '万相不再提供独立模型仓库入口');
+  for (const [id, category] of [['fal', 'api'], ['aliyun-bailian', 'api'], ['autodl', 'compute'], ['google-colab', 'compute'], ['hugging-face', 'community'], ['modelscope', 'community']]) {
+    assert.equal(parsedTools.find((tool) => tool.id === id)?.category, category, '应保留原有资源入口：' + id);
+  }
+});
+
+test('工具页展示官方 Logo、能力筛选与建议收录入口', async () => {
+  if (parsedTools.length === 0) return;
+  const html = await read('tools/index.html');
+
+  // 官方 Logo：卡片里是 <img>，并且保留首字母兜底（图片加载失败时露出）
+  const logoFiles = parsedTools.filter((tool) => tool.logo).map((tool) => tool.logo);
+  assert.ok(logoFiles.length >= parsedTools.length - 5, '绝大多数工具应有官方 Logo');
+  for (const file of logoFiles) {
+    assert.ok(existsSync(path.join(root, 'public', file)), 'Logo 文件缺失：' + file);
+    assert.ok(html.includes(file), '工具页没有引用 Logo：' + file);
+  }
+  assert.match(html, /class="tool-mark__fallback"/, '缺少首字母兜底');
+  // 有图标时首字母必须默认隐藏：否则透明图标的空白处会露出字母，观感很差
+  assert.match(html, /class="tool-mark__fallback"[^>]*data-fallback hidden/, '有 Logo 时首字母兜底必须默认隐藏');
+  assert.match(html, /data-mono="true"/, '单色标志需要 data-mono 钩子做深色反色');
+
+  // 能力筛选与场景筛选
+  assert.match(html, /data-filter-cap="open-source"/, '缺少「开源」能力筛选');
+  assert.match(html, /data-filter-cap="local"/, '缺少「本地部署」能力筛选');
+  assert.match(html, /data-filter-cap="beginner"/, '缺少「入门友好」能力筛选');
+  assert.match(html, /data-capabilities=/, '卡片缺少能力标签数据属性');
+
+  // 建议收录入口指向现有的 GitHub Issue 模板
+  assert.match(html, /issues\/new\?template=tool-suggestion\.yml/, '缺少工具建议 Issue 入口');
+  assert.match(html, /收录不等于推荐/, '缺少「收录不等于推荐」说明');
+});
+
+test('Agent 按国内、海外和非官方社区分组，官方开源工具不进入社区折叠区', async () => {
+  if (parsedTools.length === 0) return;
+  const html = await read('tools/index.html');
+  assert.match(html, /data-collapse/, '缺少社区 Agent 折叠区');
+  assert.match(html, /更多社区 Agent 与 Harness/, '折叠区缺少标题');
+  assert.match(html, /默认收起，搜索或能力筛选时自动展开/, '折叠区缺少展开说明');
+
+  const groups = Object.fromEntries(['domestic', 'overseas', 'community'].map((id) => [
+    id,
+    html.match(new RegExp('<section\\b[^>]*data-tool-group="agent-' + id + '"[\\s\\S]*?<\\/section>'))?.[0] ?? '',
+  ]));
+  for (const [id, group] of Object.entries(groups)) assert.ok(group, '缺少 Agent 分组：' + id);
+  assert.ok(html.indexOf(groups.domestic) < html.indexOf(groups.overseas), '国内工具应排在海外工具之前');
+  assert.ok(html.indexOf(groups.overseas) < html.indexOf(groups.community), '社区项目应排在海外工具之后');
+  const agentTools = parsedTools.filter((tool) => tool.category === 'agent' || tool.alsoIn.includes('agent'));
+  const selectedAgent = catalogViews(html).agent.categories[0].groups;
+  for (const tool of agentTools) {
+    assert.ok(selectedAgent.find((group) => group.key === 'agent-' + tool.catalogGroup)?.toolIds.includes(tool.id), 'Agent 条目未进入所属分组：' + tool.id);
+  }
+  const renderedIds = [...html.matchAll(/data-tool-id="([^"]+)"/g)].map((match) => match[1]);
+  assert.equal(renderedIds.length, parsedTools.length, '工具分组后不应遗漏或额外复制卡片');
+  assert.equal(new Set(renderedIds).size, parsedTools.length, '同一个工具不能因次要分类而重复渲染');
+
+  const cardTag = (id) => html.match(new RegExp('<article\\b[^>]*data-tool-id="' + id + '"[^>]*>'))?.[0] ?? '';
+  for (const id of ['opencode', 'pi', 'openclaw']) {
+    assert.ok(cardTag(id), '缺少直接显示的社区工具：' + id);
+    assert.doesNotMatch(cardTag(id), /data-collapsed="true"/, id + ' 应直接显示');
+  }
+  // 厂商自家 Agent 即使开源或标为社区热门，也必须直接展示，不进入社区区。
+  for (const id of ['deepseek-harness', 'qwen-code', 'hermes-agent', 'zcode', 'workbuddy', 'qoder', 'kimi-code', 'minimax-code']) {
+    assert.ok(parsedTools.some((tool) => tool.id === id), '缺少厂商 Agent：' + id);
+    assert.ok(cardTag(id), '工具页缺少厂商 Agent 卡片：' + id);
+    assert.doesNotMatch(cardTag(id), /data-collapsed="true"/, id + ' 应直接显示');
+    assert.ok(!groups.community.includes('data-tool-id="' + id + '"'), id + ' 不属于非官方社区项目');
+  }
+  for (const id of ['deepseek-harness', 'qwen-code']) {
+    assert.ok(groups.domestic.includes('data-tool-id="' + id + '"'), id + ' 应归入国内工具');
+  }
+  assert.ok(groups.overseas.includes('data-tool-id="hermes-agent"'), 'Hermes Agent 应归入海外工具');
+  for (const id of ['cline', 'openhands', 'oh-my-pi', 'goose', 'aider', 'open-interpreter', 'mini-swe-agent', 'langgraph', 'browser-use', 'crewai']) {
+    assert.ok(parsedTools.some((tool) => tool.id === id), '折叠清单里的工具不存在：' + id);
+    assert.ok(selectedAgent.find((group) => group.key === 'agent-community').collapsedIds.includes(id), id + ' 在 Agent 栏目中应默认收起');
+  }
+
+  // 搜索或能力筛选生效时自动展开折叠区，场景分类本身不触发展开。
+  const filterSource = await readFile(path.join(root, 'src/scripts/filter.ts'), 'utf8');
+  assert.match(filterSource, /details\.open = filtering/, '筛选生效时应自动展开折叠区');
+});
+
+test('图标加载失败时移除图片并显示首字母，不能访问已脱离的父节点', async () => {
+  if (!parsedTools.some(tool => tool.logo)) return;
+  const html = await read('tools/index.html');
+  const handler = html.match(/<img\b[^>]*class="tool-mark__img"[^>]*onerror="([^"]+)"/)?.[1];
+  assert.ok(handler, '工具图标缺少加载失败处理');
+  const fallback = { hidden: true };
+  const image = {
+    parentElement: {
+      querySelector(selector) {
+        assert.equal(selector, '[data-fallback]');
+        return fallback;
+      },
+    },
+    removed: false,
+    remove() {
+      this.parentElement = null;
+      this.removed = true;
+    },
+  };
+  // 执行构建产物中的真实处理函数；remove 后 parentElement 与浏览器一样变为 null。
+  assert.doesNotThrow(() => runInNewContext('(function () { ' + handler + ' }).call(image)', { image }));
+  assert.equal(image.removed, true, '失败图片应被移除');
+  assert.equal(fallback.hidden, false, '首字母兜底应恢复显示');
+});
+
+test('GitHub 产品官网不会被误当成代码仓库', async () => {
+  if (!parsedTools.some((tool) => tool.id === 'github-copilot')) return;
+  const html = await read('tools/index.html');
+  const cards = html.match(/<article\b[^>]*class="tool-card card"[\s\S]*?<\/article>/g) ?? [];
+  const copilot = cards.find((card) => card.includes('data-tool-id="github-copilot"'));
+  assert.ok(copilot, '缺少 GitHub Copilot 卡片');
+  const footer = copilot.match(/<div class="tool-card__foot">[\s\S]*?<\/div>/)?.[0] ?? '';
+  assert.match(footer, /href="https:\/\/github\.com\/features\/copilot"/, '官网入口应指向 Copilot 产品页');
+  assert.match(footer, /打开官网/, 'GitHub 域名上的产品页仍应显示「打开官网」');
+  assert.doesNotMatch(footer, /class="tool-card__repo"[^>]*href="https:\/\/github\.com\/features\/copilot"/, '产品页不能作为代码仓库入口');
+});
+
+test('工具数据进入搜索索引：别名、技术类型与能力标签都可搜', async () => {
+  if (parsedTools.length === 0) return;
+  const data = JSON.parse(await read('search-index.json'));
+  assert.doesNotMatch(JSON.stringify(data), /免费|\bfree(?:mium|\s+(?:tier|credits?|usage|access|plan))\b/i, '搜索索引不应保留零成本使用表述');
+  const toolItems = data.filter((item) => item.type === '工具');
+  assert.equal(toolItems.length, parsedTools.length, '搜索索引中的工具数量与目录不一致');
+
+  for (const tool of parsedTools) {
+    const item = toolItems.find((entry) => entry.title === tool.name);
+    assert.ok(item, '搜索索引缺少工具：' + tool.name);
+    for (const alias of tool.aliases) {
+      assert.ok(item.keywords.includes(alias), '搜索索引缺少别名：' + tool.name + ' / ' + alias);
+    }
+  }
+
+  // 产品与工作流的技术类型仍应进入索引。
+  assert.ok(
+    toolItems.some((item) => item.keywords.includes('图像工作流')),
+    '搜索索引应包含技术类型关键词',
   );
 });
